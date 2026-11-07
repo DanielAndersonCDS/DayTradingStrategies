@@ -1,0 +1,165 @@
+//@version=6
+// Strategy derived from the HTF logic of "Market Matrix (Zeiierman)" (CC BY-NC-SA 4.0).
+// Indicator maths (RTI, Range Oscillator, Swing VWAP) is re-implemented here; the
+// drawing code is dropped. All HTF values come from the LAST CLOSED HTF bar (no repaint).
+strategy("Market Matrix HTF Trend Strategy", overlay=true, initial_capital=10000,
+     pyramiding=0, process_orders_on_close=true,
+     commission_type=strategy.commission.percent, commission_value=0.01,
+     slippage=5, margin_long=1, margin_short=1)
+
+// ---------- Inputs ----------
+htfTf       = input.timeframe("D", "HTF for signals")
+riskPct     = input.float(1.0, "Risk per trade (% equity)", minval=0.1, step=0.1)
+atrMult     = input.float(1.5, "Stop = ATR(14) x", minval=0.1, step=0.1)
+rr          = input.float(2.0, "Take profit (R multiple)", minval=0.5, step=0.5)
+ladderOn    = input.bool(false, "Break-even / step-up ladder")
+beAtR       = input.float(3.0, "Move SL to break-even at (R)", minval=1.0, step=0.5)
+
+swLen       = input.int(50, "Swing period", minval=2)
+vwApt       = input.float(20.0, "VWAP adaptive price tracking", minval=1)
+rsiLen      = input.int(14, "RSI period")
+rsiMaLen    = input.int(9, "RSI MA period")
+macdFast    = input.int(12, "MACD fast")
+macdSlow    = input.int(26, "MACD slow")
+macdSig     = input.int(9, "MACD signal")
+rtiLen      = input.int(100, "RTI length")
+rtiSens     = input.int(95, "RTI sensitivity")
+rtiOb       = input.float(80, "RTI overbought")
+rtiOs       = input.float(20, "RTI oversold")
+rangeLen    = input.int(50, "Range osc length")
+rangeAtrLen = input.int(200, "Range osc ATR length (indicator uses 2000, fallback 200)")
+rangeMult   = input.float(2.0, "Range osc width multiplier")
+
+if timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(htfTf)
+    runtime.error("Chart timeframe must be equal to or lower than the HTF.")
+
+// ---------- HTF calculations (run inside request.security) ----------
+htf_calc() =>
+    float r   = ta.rsi(close, rsiLen)
+    float rma = ta.sma(r, rsiMaLen)
+    [m, s, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+
+    // Relative Trend Index (latest value only)
+    float dev = ta.stdev(close, 2)
+    float upT = close + dev
+    float loT = close - dev
+    int upR = math.max(1, math.min(rtiLen, int(math.round(rtiSens / 100.0 * rtiLen))))
+    int loR = math.max(1, math.min(rtiLen, int(math.round((100.0 - rtiSens) / 100.0 * rtiLen))))
+    float hi = ta.percentile_nearest_rank(upT, rtiLen, (upR - 0.5) * 100.0 / rtiLen)
+    float lo = ta.percentile_nearest_rank(loT, rtiLen, (loR - 0.5) * 100.0 / rtiLen)
+    float rti = hi != lo ? 100.0 * (close - lo) / (hi - lo) : na
+
+    // Range Oscillator (weighted-centre mean, ATR-normalised)
+    float rAtr = ta.atr(rangeAtrLen) * rangeMult
+    float wsum = 0.0
+    float wtot = 0.0
+    for i = 0 to rangeLen - 1
+        float pc = close[i + 1]
+        float cc = close[i]
+        if not na(pc) and not na(cc) and pc != 0
+            float w = math.abs(cc - pc) / pc
+            wsum += cc * w
+            wtot += w
+    float mean = wtot != 0 ? wsum / wtot : na
+    float osc = not na(mean) and not na(rAtr) and rAtr != 0 ? 100.0 * (close - mean) / rAtr : na
+
+    // Swing direction: last "highest of swLen bars" vs last "lowest of swLen bars"
+    float hh = ta.highest(high, swLen)
+    float ll = ta.lowest(low, swLen)
+    var int phI = -1
+    var int plI = -1
+    if high >= hh
+        phI := bar_index
+    if low <= ll
+        plI := bar_index
+    int dir = phI > plI ? 1 : -1
+    int prevDir = nz(dir[1], 0)
+
+    // Swing-anchored VWAP (exponentially weighted, re-anchored on each direction flip)
+    float apt = math.round(math.max(5.0, math.min(300.0, vwApt)))
+    float alpha = 1.0 - math.exp(-math.log(2.0) / apt)
+    var float wp = na
+    var float wv = na
+    int anchor = dir > 0 ? plI : phI
+    if prevDir != 0 and dir != prevDir and anchor >= 0
+        int back = math.min(bar_index - anchor, 900)
+        float av = nz(volume[back])
+        wp := (dir > 0 ? low[back] : high[back]) * av
+        wv := av
+        for k = back to 0
+            float vk = nz(volume[k])
+            wp := (1.0 - alpha) * wp + alpha * hlc3[k] * vk
+            wv := (1.0 - alpha) * wv + alpha * vk
+    else
+        if na(wp)
+            wp := hlc3 * nz(volume)
+            wv := nz(volume)
+        wp := (1.0 - alpha) * wp + alpha * hlc3 * nz(volume)
+        wv := (1.0 - alpha) * wv + alpha * nz(volume)
+    float vw = wv > 0 ? wp / wv : na
+
+    [dir, vw, close, hist, hist[1], r, rma, osc, rti]
+
+htf_prev() =>
+    [d, v, c, h0, h1, r, rm, o, rt] = htf_calc()
+    [d[1], v[1], c[1], h0[1], h1[1], r[1], rm[1], o[1], rt[1]]
+
+[hDir, hVw, hC, hHist, hHistP, hRsi, hRsiMa, hOsc, hRti] = request.security(syminfo.tickerid, htfTf, htf_prev(), lookahead = barmerge.lookahead_on)
+
+// ---------- Rules ----------
+longCond  = not na(hVw) and hC > hVw and hDir == 1 and hHist > 0 and hHist > hHistP and hRsi > hRsiMa and hRsi > 50 and hOsc > 0 and hRti < rtiOb
+shortCond = not na(hVw) and hC < hVw and hDir == -1 and hHist < 0 and hHist < hHistP and hRsi < hRsiMa and hRsi < 50 and hOsc < 0 and hRti > rtiOs
+longSig   = longCond and not longCond[1]
+shortSig  = shortCond and not shortCond[1]
+
+atrC = ta.atr(14)
+f_qty(float riskD) =>
+    math.round(strategy.equity * riskPct / 100.0 / (riskD * syminfo.pointvalue), 2)
+
+var float entryPx = na
+var float riskD   = na
+var float stopPx  = na
+var float tpPx    = na
+
+if strategy.position_size == 0 and not na(atrC)
+    float d = atrC * atrMult
+    float q = f_qty(d)
+    if q > 0
+        if longSig
+            entryPx := close
+            riskD := d
+            stopPx := close - d
+            tpPx := close + rr * d
+            strategy.entry("L", strategy.long, qty = q)
+            strategy.exit("XL", "L", stop = stopPx, limit = tpPx)
+        else if shortSig
+            entryPx := close
+            riskD := d
+            stopPx := close + d
+            tpPx := close - rr * d
+            strategy.entry("S", strategy.short, qty = q)
+            strategy.exit("XS", "S", stop = stopPx, limit = tpPx)
+
+// ---------- Management ----------
+if strategy.position_size > 0
+    if ladderOn
+        float k = math.floor((high - entryPx) / riskD)
+        if k >= beAtR
+            stopPx := math.max(stopPx, entryPx + (k - beAtR) * riskD)
+    if hDir == -1
+        strategy.close("L", comment = "VWAP flip")
+    else
+        strategy.exit("XL", "L", stop = stopPx, limit = tpPx)
+
+if strategy.position_size < 0
+    if ladderOn
+        float k = math.floor((entryPx - low) / riskD)
+        if k >= beAtR
+            stopPx := math.min(stopPx, entryPx - (k - beAtR) * riskD)
+    if hDir == 1
+        strategy.close("S", comment = "VWAP flip")
+    else
+        strategy.exit("XS", "S", stop = stopPx, limit = tpPx)
+
+plot(strategy.position_size != 0 ? stopPx : na, "Stop", color.red, style = plot.style_linebr)
+plot(strategy.position_size != 0 ? tpPx : na, "Target", color.green, style = plot.style_linebr)

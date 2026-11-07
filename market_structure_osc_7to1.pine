@@ -1,0 +1,182 @@
+//@version=6
+strategy("Market Structure Oscillator 7:1 (reconstruction)", overlay=true, initial_capital=10000, pyramiding=0,
+     margin_long=0, margin_short=0, slippage=0, max_labels_count=500,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.15)          // per side, USD per oz (0.30 round trip). Edit to your broker's real cost.
+
+// =====================================================================
+//  Rebuilt from the public description of "Market Structure Oscillator
+//  [BigBeluga]". This is NOT the original source code.
+//  1. Structure: pivots (left/right) -> a close beyond the last swing is a
+//     break. First break in a new direction = CHoCH, repeats = BoS.
+//  2. Oscillator: (close - close[len]) / stdev -> sigmoid (0..100) -> EMA,
+//     forced >= 50 in a bullish structure and <= 50 in a bearish one.
+//  3. Divergence: price vs oscillator pivots.
+//  Entry at the next bar's open, stop beyond the structural swing (or the
+//  divergence pivot), fixed reward:risk, 1% risk per trade.
+// =====================================================================
+
+// ---------------- inputs
+gS = "Signals"
+mode     = input.string("CHoCH + BoS", "Entry signal", options=["CHoCH + BoS", "CHoCH only", "BoS only", "Divergence only", "All"], group=gS,
+     tooltip="Test each mode on its own.")
+msL      = input.int(8, "Market structure pivot left", minval=2, group=gS)
+msR      = input.int(8, "Market structure pivot right", minval=2, group=gS)
+momLen   = input.int(20, "Momentum length", minval=5, group=gS)
+smLen    = input.int(5, "Smoothing length", minval=1, group=gS)
+divL     = input.int(5, "Divergence pivot left", minval=2, group=gS)
+divR     = input.int(5, "Divergence pivot right", minval=2, group=gS)
+minStr   = input.float(0.0, "Min momentum strength for breaks (0 = off)", minval=0.0, maxval=50.0, step=5.0, group=gS,
+     tooltip="Longs need oscillator >= 50 + this value, shorts need <= 50 - this value.")
+showLbl  = input.bool(true, "Show CHoCH / BoS labels", group=gS)
+
+gR = "Risk"
+atrLen   = input.int(14, "ATR length", minval=1, group=gR)
+rr       = input.float(7.0, "Reward : Risk", minval=1.0, step=0.5, group=gR)
+riskPct  = input.float(1.0, "Risk per trade, % of equity", minval=0.1, step=0.1, group=gR)
+stopBuf  = input.float(0.1, "Stop buffer beyond swing (ATR x)", minval=0.0, step=0.05, group=gR)
+minStop  = input.float(1.0, "Min stop distance (ATR x)", minval=0.1, step=0.1, group=gR)
+maxStop  = input.float(4.0, "Max stop distance (ATR x), skip if wider", minval=1.0, step=0.5, group=gR)
+maxBars  = input.int(0, "Time stop in bars (0 = off)", minval=0, group=gR)
+
+gF = "Session filter"
+sessMode = input.string("Off", "Session", options=["Off", "London + New York", "London", "New York"], group=gF)
+
+// ---------------- session
+inLN  = not na(time(timeframe.period, "0300-1200", "America/New_York"))
+inLon = not na(time(timeframe.period, "0800-1630", "Europe/London"))
+inNY  = not na(time(timeframe.period, "0800-1700", "America/New_York"))
+bool sessOK = true
+if timeframe.isintraday
+    sessOK := switch sessMode
+        "London + New York" => inLN
+        "London" => inLon
+        "New York" => inNY
+        => true
+
+atr = ta.atr(atrLen)
+
+// ---------------- 1. market structure
+ph = ta.pivothigh(high, msL, msR)
+pl = ta.pivotlow(low, msL, msR)
+
+var float shP = na
+var float slP = na
+var bool shBroken = true
+var bool slBroken = true
+var int trend = 0
+var int cnt = 0
+
+if not na(ph)
+    shP := ph
+    shBroken := false
+if not na(pl)
+    slP := pl
+    slBroken := false
+
+bool brkUp = not na(shP) and not shBroken and close > shP
+bool brkDn = not na(slP) and not slBroken and close < slP
+if brkUp and brkDn
+    brkUp := false
+    brkDn := false
+
+bool chochUp = false
+bool bosUp = false
+bool chochDn = false
+bool bosDn = false
+float refUp = na
+float refDn = na
+
+if brkUp
+    chochUp := trend != 1
+    bosUp := trend == 1
+    cnt := bosUp ? cnt + 1 : 1
+    refUp := slP
+    trend := 1
+    shBroken := true
+    if showLbl
+        label.new(bar_index, low, (chochUp ? "CHoCH" : "BoS " + str.tostring(cnt)), style = label.style_label_up,
+             color = color.new(color.green, 20), textcolor = color.white, size = size.tiny)
+if brkDn
+    chochDn := trend != -1
+    bosDn := trend == -1
+    cnt := bosDn ? cnt + 1 : 1
+    refDn := shP
+    trend := -1
+    slBroken := true
+    if showLbl
+        label.new(bar_index, high, (chochDn ? "CHoCH" : "BoS " + str.tostring(cnt)), style = label.style_label_down,
+             color = color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+
+// ---------------- 2. trend-filtered momentum oscillator
+float sd  = ta.stdev(close, momLen)
+float raw = sd > 0 ? (close - close[momLen]) / sd : 0.0
+float sgm = 100.0 / (1.0 + math.exp(-raw))
+float smo = ta.ema(sgm, smLen)
+float osc = trend == 1 ? math.max(smo, 50.0) : trend == -1 ? math.min(smo, 50.0) : smo
+
+// ---------------- 3. divergence
+float poh = ta.pivothigh(osc, divL, divR)
+float pol = ta.pivotlow(osc, divL, divR)
+var float prevPhOsc = na
+var float prevPhPx = na
+var float prevPlOsc = na
+var float prevPlPx = na
+bool bearDiv = false
+bool bullDiv = false
+float divHigh = na
+float divLow = na
+
+if not na(poh)
+    float px = high[divR]
+    if not na(prevPhOsc) and px > prevPhPx and poh < prevPhOsc
+        bearDiv := true
+        divHigh := px
+    prevPhOsc := poh
+    prevPhPx := px
+if not na(pol)
+    float px2 = low[divR]
+    if not na(prevPlOsc) and px2 < prevPlPx and pol > prevPlOsc
+        bullDiv := true
+        divLow := px2
+    prevPlOsc := pol
+    prevPlPx := px2
+
+// ---------------- signals
+bool useChoch = mode == "CHoCH + BoS" or mode == "CHoCH only" or mode == "All"
+bool useBos   = mode == "CHoCH + BoS" or mode == "BoS only" or mode == "All"
+bool useDiv   = mode == "Divergence only" or mode == "All"
+
+bool longBrk  = ((useChoch and chochUp) or (useBos and bosUp)) and osc >= 50.0 + minStr
+bool shortBrk = ((useChoch and chochDn) or (useBos and bosDn)) and osc <= 50.0 - minStr
+bool longDiv  = useDiv and bullDiv
+bool shortDiv = useDiv and bearDiv
+bool longSig  = longBrk or longDiv
+bool shortSig = shortBrk or shortDiv
+
+// ---------------- entries / exits
+if barstate.isconfirmed and not na(atr) and sessOK and strategy.position_size == 0 and (longSig != shortSig)
+    int sig = longSig ? 1 : -1
+    float ref = na
+    if sig == 1
+        ref := longBrk and not na(refUp) ? refUp : longDiv ? divLow : na
+    else
+        ref := shortBrk and not na(refDn) ? refDn : shortDiv ? divHigh : na
+    if not na(ref)
+        float dist = sig == 1 ? close - ref : ref - close
+        float riskDist = math.max(dist + stopBuf * atr, minStop * atr)
+        if riskDist <= maxStop * atr
+            float qty = (strategy.equity * riskPct / 100.0) / (riskDist * syminfo.pointvalue)
+            string sid = sig == 1 ? "L" : "S"
+            strategy.entry(sid, sig == 1 ? strategy.long : strategy.short, qty = qty)
+            strategy.exit("X", sid, loss = riskDist / syminfo.mintick, profit = riskDist * rr / syminfo.mintick)
+
+// ---------------- optional time stop
+if maxBars > 0 and strategy.position_size != 0
+    if bar_index - strategy.opentrades.entry_bar_index(0) >= maxBars
+        strategy.close_all(comment = "time stop")
+
+// ---------------- visuals
+plotshape(longDiv, "Bullish divergence", shape.diamond, location.belowbar, color.new(color.aqua, 0), size = size.tiny)
+plotshape(shortDiv, "Bearish divergence", shape.diamond, location.abovebar, color.new(color.orange, 0), size = size.tiny)
+bgcolor(trend == 1 ? color.new(color.green, 95) : trend == -1 ? color.new(color.red, 95) : na)

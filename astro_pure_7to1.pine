@@ -1,0 +1,168 @@
+//@version=6
+strategy("Astrology Only (video rules) 7:1", overlay=true, initial_capital=10000, pyramiding=0,
+     margin_long=0, margin_short=0, slippage=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.15)          // per side, USD per oz (0.30 round trip). Edit to your broker's real cost.
+
+// =====================================================================
+//  ONLY the rules stated in the video (Norman Winski interview):
+//   1. Time matters more than price: turns come at the right time.
+//   2. Currencies, stocks, bonds, grains and PRECIOUS METALS turn within
+//      a day of a new Moon or full Moon.
+//   3. Mercury turning retrograde / direct is another turn window.
+//   4. A setup is needed: the market must have moved sharply up or sharply
+//      down. Sideways = no trade.
+//   5. Market running up -> look to SELL. Going down -> look to BUY.
+//  No candlestick patterns, no moving averages, no oscillators.
+//  Stop size, lookback and the 7:1 target are NOT from the video.
+// =====================================================================
+
+gA = "Astrology timing (from the video)"
+astroMode = input.string("Moon", "Event windows", options=["Off", "Moon", "Mercury stations", "Either"], group=gA,
+     tooltip="Off = CONTROL: no astro timing, only the 'market moved sharply' setup.")
+winDays   = input.float(1.0, "Within a day of the event (half-width, days)", minval=0.1, step=0.25, group=gA)
+ctrlShift = input.float(0.0, "CONTROL TEST: shift the astro calendar by N days", step=0.5, group=gA,
+     tooltip="Try 7.4 for the Moon (quarter moons) and 30 for Mercury. If shifted dates work as well as the real ones, there is no astrology effect.")
+
+gS = "Setup: market moved sharply (thresholds are mine)"
+moveBars = input.int(24, "Look back this many bars (H1: 24, H4: 6, D1: 5)", minval=2, group=gS)
+moveATR  = input.float(3.0, "Net move at least this many ATR, otherwise sideways = no trade", minval=0.5, step=0.5, group=gS)
+
+gR = "Risk management (yours, not from the video)"
+atrLen   = input.int(14, "ATR length", minval=1, group=gR)
+stopATR  = input.float(1.5, "Stop distance in ATR", minval=0.2, step=0.1, group=gR)
+rr       = input.float(7.0, "Reward : Risk", minval=1.0, step=0.5, group=gR)
+riskPct  = input.float(1.0, "Risk per trade, % of equity", minval=0.1, step=0.1, group=gR)
+
+gB = "Break-even / trailing stop (in R, 1R = initial risk)"
+beTrigger = input.float(0.0, "Move SL once profit reaches this many R (0 = off)", minval=0.0, step=0.5, group=gB)
+beLock    = input.float(0.0, "SL goes to entry + this many R (0 = break-even)", step=0.1, group=gB)
+trailStep = input.float(1.0, "Then lock +1 step per extra step of profit (0 = break-even only)", minval=0.0, step=0.5, group=gB)
+
+// ---------------- astronomy (low-precision Keplerian elements, Schlyter formulas)
+atan2r(float y, float x) =>
+    float r = 0.0
+    if x > 0
+        r := math.atan(y / x)
+    else if x < 0
+        r := y >= 0 ? math.atan(y / x) + math.pi : math.atan(y / x) - math.pi
+    else
+        r := y > 0 ? math.pi / 2 : y < 0 ? -math.pi / 2 : 0.0
+    r
+
+kepler(float mDeg, float e) =>
+    float m = math.toradians(mDeg)
+    float ea = m + e * math.sin(m) * (1.0 + e * math.cos(m))
+    for k = 1 to 5
+        ea := ea - (ea - e * math.sin(ea) - m) / (1.0 - e * math.cos(ea))
+    ea
+
+normDeg(float x) =>
+    float y = x % 360.0
+    y < 0 ? y + 360.0 : y
+
+sunPos(float d) =>
+    float ws = 282.9404 + 4.70935e-5 * d
+    float e = 0.016709 - 1.151e-9 * d
+    float ms = 356.0470 + 0.9856002585 * d
+    float ea = kepler(ms, e)
+    float xv = math.cos(ea) - e
+    float yv = math.sqrt(1.0 - e * e) * math.sin(ea)
+    float r = math.sqrt(xv * xv + yv * yv)
+    float lon = atan2r(yv, xv) + math.toradians(ws)
+    [r * math.cos(lon), r * math.sin(lon), normDeg(math.todegrees(lon)), ms, ws]
+
+// Moon - Sun elongation in degrees: 0 = new Moon, 180 = full Moon
+moonElong(float d) =>
+    [xs, ys, sunLon, ms, ws] = sunPos(d)
+    float nn = 125.1228 - 0.0529538083 * d
+    float w = 318.0634 + 0.1643573223 * d
+    float e = 0.054900
+    float mm = 115.3654 + 13.0649929509 * d
+    float ea = kepler(mm, e)
+    float xv = 60.2666 * (math.cos(ea) - e)
+    float yv = 60.2666 * math.sqrt(1.0 - e * e) * math.sin(ea)
+    float vw = atan2r(yv, xv) + math.toradians(w)
+    float r = math.sqrt(xv * xv + yv * yv)
+    float inc = math.toradians(5.1454)
+    float nr = math.toradians(nn)
+    float xh = r * (math.cos(nr) * math.cos(vw) - math.sin(nr) * math.sin(vw) * math.cos(inc))
+    float yh = r * (math.sin(nr) * math.cos(vw) + math.cos(nr) * math.sin(vw) * math.cos(inc))
+    float lon = math.todegrees(atan2r(yh, xh))
+    float ls = ws + ms
+    float lm = nn + w + mm
+    float dd = lm - ls
+    float ff = lm - nn
+    lon += -1.274 * math.sin(math.toradians(mm - 2 * dd)) + 0.658 * math.sin(math.toradians(2 * dd)) - 0.186 * math.sin(math.toradians(ms)) - 0.059 * math.sin(math.toradians(2 * mm - 2 * dd)) - 0.057 * math.sin(math.toradians(mm - 2 * dd + ms)) + 0.053 * math.sin(math.toradians(mm + 2 * dd)) + 0.046 * math.sin(math.toradians(2 * dd - ms)) + 0.041 * math.sin(math.toradians(mm - ms)) - 0.035 * math.sin(math.toradians(dd)) - 0.031 * math.sin(math.toradians(mm + ms)) - 0.015 * math.sin(math.toradians(2 * ff - 2 * dd)) + 0.011 * math.sin(math.toradians(mm - 4 * dd))
+    normDeg(lon - sunLon)
+
+mercLon(float d) =>
+    [xs, ys, sunLon, ms, ws] = sunPos(d)
+    float nn = math.toradians(48.3313 + 3.24587e-5 * d)
+    float inc = math.toradians(7.0047 + 5.0e-8 * d)
+    float w = math.toradians(29.1241 + 1.01444e-5 * d)
+    float a = 0.387098
+    float e = 0.205635 + 5.59e-10 * d
+    float mm = 168.6562 + 4.0923344368 * d
+    float ea = kepler(mm, e)
+    float xv = a * (math.cos(ea) - e)
+    float yv = a * math.sqrt(1.0 - e * e) * math.sin(ea)
+    float vw = atan2r(yv, xv) + w
+    float r = math.sqrt(xv * xv + yv * yv)
+    float xh = r * (math.cos(nn) * math.cos(vw) - math.sin(nn) * math.sin(vw) * math.cos(inc))
+    float yh = r * (math.sin(nn) * math.cos(vw) + math.cos(nn) * math.sin(vw) * math.cos(inc))
+    math.todegrees(atan2r(yh + ys, xh + xs))
+
+mercRetro(float d) =>
+    float diff = mercLon(d + 0.5) - mercLon(d - 0.5)
+    (diff + 540.0) % 360.0 - 180.0 < 0
+
+atr = ta.atr(atrLen)
+
+// ---------------- astro window
+float dAst = time / 86400000.0 + 2440587.5 - 2451543.5 + ctrlShift
+bool doMoon = astroMode == "Moon" or astroMode == "Either"
+bool doMerc = astroMode == "Mercury stations" or astroMode == "Either"
+float eMoon = doMoon ? moonElong(dAst) : 0.0
+bool moonNear = doMoon and math.min(math.min(eMoon, 360.0 - eMoon), math.abs(eMoon - 180.0)) / 12.19 <= winDays
+bool mercNear = doMerc and (mercRetro(dAst - winDays) != mercRetro(dAst + winDays))
+bool inWin = astroMode == "Off" or moonNear or mercNear
+
+// one trade per window
+var bool traded = true
+if inWin and not nz(inWin[1], false)
+    traded := false
+
+// ---------------- setup: market moved sharply
+float disp = (close - close[moveBars]) / atr
+bool sharp = math.abs(disp) >= moveATR
+
+var float entryRisk = na
+var float peakPx = na
+
+// ---------------- entry: running up -> SELL, going down -> BUY
+if barstate.isconfirmed and not na(atr) and strategy.position_size == 0 and inWin and not traded and sharp
+    bool isBuy = disp < 0
+    float riskDist = stopATR * atr
+    float qty = (strategy.equity * riskPct / 100.0) / (riskDist * syminfo.pointvalue)
+    string sid = isBuy ? "L" : "S"
+    strategy.entry(sid, isBuy ? strategy.long : strategy.short, qty = qty)
+    strategy.exit("X", sid, loss = riskDist / syminfo.mintick, profit = riskDist * rr / syminfo.mintick)
+    entryRisk := riskDist
+    traded := true
+
+// ---------------- break-even / trailing stop
+if beTrigger > 0 and strategy.position_size != 0 and not na(entryRisk)
+    int dirN = strategy.position_size > 0 ? 1 : -1
+    float avg = strategy.position_avg_price
+    peakPx := na(peakPx) ? (dirN == 1 ? high : low) : (dirN == 1 ? math.max(peakPx, high) : math.min(peakPx, low))
+    float profR = dirN * (peakPx - avg) / entryRisk
+    float lockR = -1.0
+    if profR >= beTrigger
+        lockR := beLock + (trailStep > 0 ? math.floor((profR - beTrigger) / trailStep) * trailStep : 0.0)
+    strategy.exit("X", dirN == 1 ? "L" : "S", stop = avg + dirN * lockR * entryRisk, limit = avg + dirN * rr * entryRisk)
+if strategy.position_size == 0
+    peakPx := na
+
+// ---------------- visuals
+bgcolor(inWin and astroMode != "Off" ? color.new(color.purple, 92) : na)

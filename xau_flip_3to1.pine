@@ -1,0 +1,45 @@
+//@version=6
+strategy("XAUUSD 3:1 Flip-on-Loss", overlay=true, initial_capital=10000,
+     pyramiding=0, margin_long=0, margin_short=0, slippage=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.15)   // per side, in USD per oz. Round trip = 0.30. Edit to your broker's real cost.
+
+// ---------------- inputs
+mode    = input.string("Flip on loss", "Strategy", options=["Flip on loss", "Trend every trade"])
+atrLen  = input.int(14, "ATR length", minval=1)
+atrMult = input.float(1.5, "Stop distance = ATR x", minval=0.1, step=0.1)
+rr      = input.float(3.0, "Reward : Risk", minval=0.5, step=0.5)
+smaLen  = input.int(50, "SMA length (trend direction)", minval=2)
+riskPct = input.float(1.0, "Risk per trade, % of equity", minval=0.1, step=0.1)
+
+// ---------------- indicators
+atr = ta.atr(atrLen)
+sma = ta.sma(close, smaLen)
+
+// ---------------- direction state
+var int dir = 0          //  1 = buy, -1 = sell
+var int seen = 0         // closed trades already processed
+
+// a trade just closed: flip if it was a loss
+if strategy.closedtrades > seen
+    seen := strategy.closedtrades
+    if mode == "Flip on loss" and strategy.closedtrades.profit(strategy.closedtrades - 1) < 0
+        dir := -dir
+
+// first trade (and every trade in trend mode) follows the SMA
+if not na(sma)
+    if dir == 0 or mode == "Trend every trade"
+        dir := close > sma ? 1 : -1
+
+// ---------------- entries / exits
+if strategy.position_size == 0 and not na(atr) and dir != 0 and barstate.isconfirmed
+    float riskDist = atrMult * atr
+    float qty = (strategy.equity * riskPct / 100.0) / (riskDist * syminfo.pointvalue)
+    string id = dir == 1 ? "L" : "S"
+    strategy.entry(id, dir == 1 ? strategy.long : strategy.short, qty = qty)
+    // ticks are measured from the actual fill price, so gaps are handled correctly
+    strategy.exit("X", id, loss = riskDist / syminfo.mintick, profit = riskDist * rr / syminfo.mintick)
+
+// ---------------- visuals
+plot(sma, "SMA", color=color.new(color.orange, 0))
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 92) : strategy.position_size < 0 ? color.new(color.red, 92) : na)

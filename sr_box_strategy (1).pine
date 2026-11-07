@@ -1,0 +1,229 @@
+//@version=5
+strategy("1H S/R Box - Reversal + Fakeout/Breakout", overlay=true, initial_capital=10000,
+     pyramiding=0, default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=0, margin_short=0, max_labels_count=500)
+
+// ============================== INPUTS ==============================
+pivL       = input.int(5, "1H pivot bars left", minval=1, group="S/R detection (1H)")
+pivR       = input.int(5, "1H pivot bars right", minval=1, group="S/R detection (1H)")
+boxPips    = input.float(100, "Box height (pips)", minval=1, group="Box")
+pipOvr     = input.float(0, "Pip size override (0 = auto: mintick x 10)", minval=0, group="Box")
+entryMode  = input.string("Box edge", "Reversal entry at", options=["Box edge", "Box center"], group="Box")
+bufPips    = input.float(0, "SL buffer (pips)", minval=0, group="Risk")
+rr         = input.float(2.0, "Reward : Risk", minval=0.1, group="Risk")
+riskPct    = input.float(5.0, "Risk per trade (% of equity)", minval=0.1, group="Risk")
+useBO      = input.bool(true, "Trade breakouts (stop orders)", group="Fakeout logic")
+expireHrs  = input.int(8, "Cancel pending BO/FO order after (hours)", minval=1, group="Fakeout logic")
+retrade    = input.bool(false, "Re-trade same level after a TP", group="Fakeout logic")
+
+// ============================== HELPERS =============================
+pip  = pipOvr > 0 ? pipOvr : syminfo.mintick * 10
+half = boxPips * pip / 2
+buf  = bufPips * pip
+tick = syminfo.mintick
+
+calcQty(dist) =>
+    math.max(strategy.equity * riskPct / 100 / (math.max(dist, tick) * syminfo.pointvalue), 0.0001)
+
+// ====================== 1H PIVOTS (non-repainting) ==================
+[phRaw, plRaw] = request.security(syminfo.tickerid, "60",
+     [ta.pivothigh(high, pivL, pivR)[1], ta.pivotlow(low, pivL, pivR)[1]],
+     lookahead=barmerge.lookahead_on)
+
+// ============================== STATE ===============================
+// 0 = armed (reversal orders), 2 = pierced, waiting for 1H close, 3 = BO/FO order live, 4 = done until new pivot
+var float resL = na
+var float supL = na
+var int   rSt = 0
+var int   sSt = 0
+var float rPH = na
+var float sPL = na
+var float rSL = na
+var float rTP = na
+var float sSL = na
+var float sTP = na
+var int   rAge = 0
+var int   sAge = 0
+var int   nClosed = 0
+var float hrH = na
+var float hrL = na
+var float prevHrH = na
+var float prevHrL = na
+
+if timeframe.in_seconds() >= 3600
+    runtime.error("Put the chart on a timeframe below 1H (15m or 5m).")
+
+newHour = barstate.isfirst or ta.change(time("60")) != 0
+if newHour
+    prevHrH := hrH
+    prevHrL := hrL
+    hrH := high
+    hrL := low
+else
+    hrH := math.max(hrH, high)
+    hrL := math.min(hrL, low)
+
+// new levels reset state
+if not na(phRaw) and phRaw != resL
+    resL := phRaw
+    rSt := 0
+    rSL := na
+    rTP := na
+    strategy.cancel("R_rev")
+if not na(plRaw) and plRaw != supL
+    supL := plRaw
+    sSt := 0
+    sSL := na
+    sTP := na
+    strategy.cancel("S_rev")
+
+resTop = resL + half
+resBot = resL - half
+supTop = supL + half
+supBot = supL - half
+entryR = entryMode == "Box edge" ? resBot : resL
+entryS = entryMode == "Box edge" ? supTop : supL
+flat   = strategy.position_size == 0
+
+// ================== 1H CLOSE DECISION AFTER A PIERCE ================
+if newHour and rSt == 2 and not na(resL)
+    h1c = close[1]
+    if not flat
+        rSt := 4
+    else if h1c > resTop and useBO
+        // BREAKOUT -> buy stop
+        px = math.max(prevHrH, close) + tick
+        rSL := resL - buf
+        rTP := px + rr * (px - rSL)
+        strategy.entry("R_bo", strategy.long, qty=calcQty(px - rSL), stop=px)
+        rSt := 3
+        rAge := 0
+    else if h1c <= resTop
+        // NO BREAKOUT (fakeout) -> sell limit at resistance
+        rSL := math.max(rPH, resTop) + buf
+        if close < entryR
+            rTP := entryR - rr * (rSL - entryR)
+            strategy.entry("R_fo", strategy.short, qty=calcQty(rSL - entryR), limit=entryR)
+        else
+            rTP := close - rr * (rSL - close)
+            strategy.entry("R_fo", strategy.short, qty=calcQty(rSL - close))
+        rSt := 3
+        rAge := 0
+    else
+        rSt := 4
+
+if newHour and sSt == 2 and not na(supL)
+    h1c = close[1]
+    if not flat
+        sSt := 4
+    else if h1c < supBot and useBO
+        // BREAKOUT -> sell stop
+        px = math.min(prevHrL, close) - tick
+        sSL := supL + buf
+        sTP := px - rr * (sSL - px)
+        strategy.entry("S_bo", strategy.short, qty=calcQty(sSL - px), stop=px)
+        sSt := 3
+        sAge := 0
+    else if h1c >= supBot
+        // NO BREAKOUT (fakeout) -> buy limit at support
+        sSL := math.min(sPL, supBot) - buf
+        if close > entryS
+            sTP := entryS + rr * (entryS - sSL)
+            strategy.entry("S_fo", strategy.long, qty=calcQty(entryS - sSL), limit=entryS)
+        else
+            sTP := close + rr * (close - sSL)
+            strategy.entry("S_fo", strategy.long, qty=calcQty(close - sSL))
+        sSt := 3
+        sAge := 0
+    else
+        sSt := 4
+
+// ======================== PIERCE DETECTION ==========================
+if not na(resL)
+    if rSt == 0 and high > resTop
+        rSt := 2
+        rPH := high
+        strategy.cancel("R_rev")
+    else if rSt == 2
+        rPH := math.max(rPH, high)
+if not na(supL)
+    if sSt == 0 and low < supBot
+        sSt := 2
+        sPL := low
+        strategy.cancel("S_rev")
+    else if sSt == 2
+        sPL := math.min(sPL, low)
+
+// ================= STATE UPDATE WHEN A TRADE CLOSES =================
+if strategy.closedtrades > nClosed
+    nClosed := strategy.closedtrades
+    id = strategy.closedtrades.entry_id(nClosed - 1)
+    if str.startswith(id, "R_")
+        if rSt == 3
+            rSt := 4
+        else if rSt == 0 and not retrade
+            rSt := 4
+    if str.startswith(id, "S_")
+        if sSt == 3
+            sSt := 4
+        else if sSt == 0 and not retrade
+            sSt := 4
+
+// ================= PENDING ORDER EXPIRY =============================
+if newHour
+    if rSt == 3
+        rAge += 1
+        if rAge >= expireHrs and flat
+            strategy.cancel("R_bo")
+            strategy.cancel("R_fo")
+            rSt := 4
+    if sSt == 3
+        sAge += 1
+        if sAge >= expireHrs and flat
+            strategy.cancel("S_bo")
+            strategy.cancel("S_fo")
+            sSt := 4
+
+// ================= REVERSAL ORDERS (touch -> trade at S/R) ==========
+if rSt == 0 and not na(resL) and flat and close < entryR
+    rSL := resTop + buf
+    rTP := entryR - rr * (rSL - entryR)
+    strategy.entry("R_rev", strategy.short, qty=calcQty(rSL - entryR), limit=entryR)
+if sSt == 0 and not na(supL) and flat and close > entryS
+    sSL := supBot - buf
+    sTP := entryS + rr * (entryS - sSL)
+    strategy.entry("S_rev", strategy.long, qty=calcQty(entryS - sSL), limit=entryS)
+
+// one position at a time: drop all pending entries once something is open
+if not flat
+    strategy.cancel("R_rev")
+    strategy.cancel("S_rev")
+    strategy.cancel("R_bo")
+    strategy.cancel("R_fo")
+    strategy.cancel("S_bo")
+    strategy.cancel("S_fo")
+
+// ============================ EXITS =================================
+if not na(rSL)
+    strategy.exit("R_rev x", "R_rev", stop=rSL, limit=rTP)
+    strategy.exit("R_fo x",  "R_fo",  stop=rSL, limit=rTP)
+    strategy.exit("R_bo x",  "R_bo",  stop=rSL, limit=rTP)
+if not na(sSL)
+    strategy.exit("S_rev x", "S_rev", stop=sSL, limit=sTP)
+    strategy.exit("S_fo x",  "S_fo",  stop=sSL, limit=sTP)
+    strategy.exit("S_bo x",  "S_bo",  stop=sSL, limit=sTP)
+
+// ============================== VISUALS =============================
+pRT = plot(resTop, "Res top", color=color.new(color.red, 50), style=plot.style_linebr)
+pRB = plot(resBot, "Res bottom", color=color.new(color.red, 50), style=plot.style_linebr)
+fill(pRT, pRB, color=color.new(color.red, 88))
+pST = plot(supTop, "Sup top", color=color.new(color.green, 50), style=plot.style_linebr)
+pSB = plot(supBot, "Sup bottom", color=color.new(color.green, 50), style=plot.style_linebr)
+fill(pST, pSB, color=color.new(color.green, 88))
+
+// ============================ DEBUG MARKERS =========================
+// Small markers so you can see the logic firing even if no trade fills.
+plotshape(rSt == 2 and rSt[1] == 0, "Res pierced", shape.xcross, location.abovebar, color.red, size=size.tiny)
+plotshape(sSt == 2 and sSt[1] == 0, "Sup pierced", shape.xcross, location.belowbar, color.green, size=size.tiny)
+plotshape(rSt == 3 and rSt[1] == 2, "Res BO/FO order", shape.diamond, location.abovebar, color.orange, size=size.tiny)
+plotshape(sSt == 3 and sSt[1] == 2, "Sup BO/FO order", shape.diamond, location.belowbar, color.orange, size=size.tiny)

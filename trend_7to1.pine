@@ -1,0 +1,98 @@
+//@version=6
+strategy("Trend Following 7:1", overlay=true, initial_capital=10000, pyramiding=0,
+     margin_long=0, margin_short=0, slippage=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.15)          // per side, USD per oz (0.30 round trip). Edit to your broker's real cost.
+
+// =====================================================================
+//  Two classic trend-following systems with a fixed reward:risk target
+//  and a break-even / ladder stop.
+//   1. Donchian breakout: close beyond the highest high / lowest low of the
+//      previous N bars.
+//   2. EMA cross: fast EMA crosses the slow EMA.
+//  Optional filters: EMA trend direction, ADX strength, trade direction.
+//  Entry at the next bar's open, stop in ATR, 1% risk per trade.
+// =====================================================================
+
+gSys = "System"
+system   = input.string("Donchian breakout", "System", options=["Donchian breakout", "EMA cross"], group=gSys)
+donLen   = input.int(55, "Donchian: breakout of the previous N bars", minval=5, group=gSys)
+fastLen  = input.int(20, "EMA cross: fast EMA", minval=2, group=gSys)
+slowLen  = input.int(50, "EMA cross: slow EMA", minval=3, group=gSys)
+dirMode  = input.string("Both", "Trade direction", options=["Both", "Long only", "Short only"], group=gSys,
+     tooltip="Gold rose strongly in much of 2024-2026, so a long-biased trend system can look great just from that. Check long only vs short only.")
+
+gF = "Trend filters"
+trendEma = input.int(200, "Only long above / short below this EMA (0 = off)", minval=0, group=gF)
+minAdx   = input.float(0.0, "Min ADX strength (0 = off)", minval=0.0, step=1.0, group=gF)
+adxLen   = input.int(14, "ADX length", minval=2, group=gF)
+
+gR = "Risk"
+atrLen   = input.int(14, "ATR length", minval=1, group=gR)
+stopATR  = input.float(2.0, "Initial stop distance in ATR", minval=0.2, step=0.1, group=gR)
+rr       = input.float(7.0, "Reward : Risk", minval=1.0, step=0.5, group=gR)
+riskPct  = input.float(1.0, "Risk per trade, % of equity", minval=0.1, step=0.1, group=gR)
+
+gB = "Break-even / trailing stop (in R, 1R = initial risk)"
+beTrigger = input.float(3.0, "Move SL once profit reaches this many R (0 = off)", minval=0.0, step=0.5, group=gB)
+beLock    = input.float(0.0, "SL goes to entry + this many R (0 = break-even)", step=0.1, group=gB)
+trailStep = input.float(1.0, "Then lock +1 step per extra step of profit (0 = break-even only)", minval=0.0, step=0.5, group=gB,
+     tooltip="With trigger 3 and step 1: at 3R the stop goes to break-even, at 4R to +1R, at 5R to +2R. The new stop is applied from the NEXT bar, which is slightly conservative.")
+
+// ---------------- indicators
+atr = ta.atr(atrLen)
+hh  = ta.highest(high, donLen)[1]       // the N bars BEFORE the current bar
+ll  = ta.lowest(low, donLen)[1]
+emaF = ta.ema(close, fastLen)
+emaS = ta.ema(close, slowLen)
+emaT = trendEma > 0 ? ta.ema(close, trendEma) : na
+[diP, diM, adxVal] = ta.dmi(adxLen, adxLen)
+
+// ---------------- signals
+bool longSig  = system == "Donchian breakout" ? close > hh : ta.crossover(emaF, emaS)
+bool shortSig = system == "Donchian breakout" ? close < ll : ta.crossunder(emaF, emaS)
+
+if trendEma > 0
+    longSig  := longSig and close > emaT
+    shortSig := shortSig and close < emaT
+if minAdx > 0
+    longSig  := longSig and adxVal >= minAdx
+    shortSig := shortSig and adxVal >= minAdx
+if dirMode == "Long only"
+    shortSig := false
+if dirMode == "Short only"
+    longSig := false
+
+var float entryRisk = na
+var float peakPx = na
+
+// ---------------- entries / exits
+if barstate.isconfirmed and not na(atr) and strategy.position_size == 0 and (longSig != shortSig)
+    bool isBuy = longSig
+    float riskDist = stopATR * atr
+    float qty = (strategy.equity * riskPct / 100.0) / (riskDist * syminfo.pointvalue)
+    string sid = isBuy ? "L" : "S"
+    strategy.entry(sid, isBuy ? strategy.long : strategy.short, qty = qty)
+    // ticks are measured from the actual fill price, so gaps are handled correctly
+    strategy.exit("X", sid, loss = riskDist / syminfo.mintick, profit = riskDist * rr / syminfo.mintick)
+    entryRisk := riskDist
+
+// ---------------- break-even / trailing stop
+if beTrigger > 0 and strategy.position_size != 0 and not na(entryRisk)
+    int dirN = strategy.position_size > 0 ? 1 : -1
+    float avg = strategy.position_avg_price
+    peakPx := na(peakPx) ? (dirN == 1 ? high : low) : (dirN == 1 ? math.max(peakPx, high) : math.min(peakPx, low))
+    float profR = dirN * (peakPx - avg) / entryRisk
+    float lockR = -1.0                                   // -1R = the original stop
+    if profR >= beTrigger
+        lockR := beLock + (trailStep > 0 ? math.floor((profR - beTrigger) / trailStep) * trailStep : 0.0)
+    strategy.exit("X", dirN == 1 ? "L" : "S", stop = avg + dirN * lockR * entryRisk, limit = avg + dirN * rr * entryRisk)
+if strategy.position_size == 0
+    peakPx := na
+
+// ---------------- visuals
+plot(system == "Donchian breakout" ? hh : emaF, "Upper / fast", color = color.new(color.aqua, 20))
+plot(system == "Donchian breakout" ? ll : emaS, "Lower / slow", color = color.new(color.orange, 20))
+plot(trendEma > 0 ? emaT : na, "Trend EMA", color = color.new(color.gray, 20))
+plotshape(longSig and strategy.position_size == 0, "Long", shape.triangleup, location.belowbar, color.new(color.lime, 0), size = size.tiny)
+plotshape(shortSig and strategy.position_size == 0, "Short", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)

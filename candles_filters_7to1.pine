@@ -1,0 +1,142 @@
+//@version=6
+strategy("Candlestick + ATR + Filters 7:1", overlay=true, initial_capital=10000, pyramiding=0,
+     margin_long=0, margin_short=0, slippage=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.15)          // per side, USD per oz (0.30 round trip). Edit to your broker's real cost.
+
+// =====================================================================
+//  Basic candlestick patterns, ATR for stops and size filtering,
+//  fixed reward:risk, 1% risk per trade. Entry at the next bar's open.
+// =====================================================================
+
+// ---------------- inputs
+gP = "Patterns"
+patSel    = input.string("All", "Pattern", options=["All", "Engulfing", "Pin bar", "Morning/Evening star"], group=gP,
+     tooltip="Test each pattern on its own to see which one (if any) carries the result.")
+minCandle = input.float(0.8, "Min signal-candle range (ATR x)", minval=0.0, step=0.1, group=gP,
+     tooltip="Ignores tiny candles that are just noise.")
+pinWick   = input.float(0.6, "Pin bar: min wick as fraction of range", minval=0.4, maxval=0.9, step=0.05, group=gP)
+pinBody   = input.float(0.3, "Pin bar: max body as fraction of range", minval=0.05, maxval=0.5, step=0.05, group=gP)
+
+gM = "Moving average filter"
+maMode    = input.string("Off", "MA filter", options=["Off", "Price vs EMA", "Fast vs slow EMA"], group=gM)
+maDir     = input.string("With", "Trade WITH or AGAINST the MA direction", options=["With", "Against"], group=gM)
+emaLen    = input.int(100, "EMA length (price vs EMA)", minval=5, group=gM)
+fastLen   = input.int(20, "Fast EMA (cross mode)", minval=2, group=gM)
+slowLen   = input.int(50, "Slow EMA (cross mode)", minval=3, group=gM)
+
+gO = "Oscillator filter"
+oscType   = input.string("Off", "Oscillator", options=["Off", "RSI", "Williams %R"], group=gO)
+oscLogic  = input.string("Reversal zone", "Logic", options=["Reversal zone", "Momentum"], group=gO,
+     tooltip="Reversal: longs only at or below the low level, shorts only at or above the high level. Momentum: longs above 50, shorts below 50.")
+oscLen    = input.int(14, "Oscillator length", minval=2, group=gO)
+oscLow    = input.float(40.0, "Reversal: longs at or below (0-100 scale)", group=gO)
+oscHigh   = input.float(60.0, "Reversal: shorts at or above (0-100 scale)", group=gO)
+
+gR = "Risk"
+atrLen   = input.int(14, "ATR length", minval=1, group=gR)
+rr       = input.float(7.0, "Reward : Risk", minval=1.0, step=0.5, group=gR)
+riskPct  = input.float(1.0, "Risk per trade, % of equity", minval=0.1, step=0.1, group=gR)
+stopBuf  = input.float(0.1, "Stop buffer beyond pattern (ATR x)", minval=0.0, step=0.05, group=gR)
+minStop  = input.float(1.0, "Min stop distance (ATR x)", minval=0.1, step=0.1, group=gR)
+maxStop  = input.float(4.0, "Max stop distance (ATR x), skip if wider", minval=1.0, step=0.5, group=gR)
+maxBars  = input.int(0, "Time stop in bars (0 = off)", minval=0, group=gR)
+
+gF = "Session filter"
+sessMode = input.string("Off", "Session", options=["Off", "London + New York", "London", "New York"], group=gF,
+     tooltip="London + New York = 03:00-12:00 New York time. Intraday charts only. Applies to new entries only.")
+
+// ---------------- session
+inLN  = not na(time(timeframe.period, "0300-1200", "America/New_York"))
+inLon = not na(time(timeframe.period, "0800-1630", "Europe/London"))
+inNY  = not na(time(timeframe.period, "0800-1700", "America/New_York"))
+bool sessOK = true
+if timeframe.isintraday
+    sessOK := switch sessMode
+        "London + New York" => inLN
+        "London" => inLon
+        "New York" => inNY
+        => true
+
+// ---------------- candle metrics
+atr  = ta.atr(atrLen)
+ema  = ta.ema(close, emaLen)
+emaF = ta.ema(close, fastLen)
+emaS = ta.ema(close, slowLen)
+float ov = oscType == "RSI" ? ta.rsi(close, oscLen) : oscType == "Williams %R" ? ta.wpr(oscLen) + 100.0 : na
+body = math.abs(close - open)
+rng  = high - low
+bodyP = math.abs(close[1] - open[1])
+body2 = math.abs(close[2] - open[2])
+
+// ---------------- patterns (all evaluated on the just-closed candle)
+bool bullEng = close[1] < open[1] and close > open and close >= open[1] and open <= close[1] and body > bodyP
+bool bearEng = close[1] > open[1] and close < open and close <= open[1] and open >= close[1] and body > bodyP
+
+float lowW = math.min(open, close) - low
+float upW  = high - math.max(open, close)
+bool bullPin = rng > 0 and lowW >= pinWick * rng and body <= pinBody * rng
+bool bearPin = rng > 0 and upW >= pinWick * rng and body <= pinBody * rng
+
+bool bullStar = close[2] < open[2] and body2 >= 0.6 * atr and bodyP <= 0.5 * body2 and close > open and close > (open[2] + close[2]) / 2
+bool bearStar = close[2] > open[2] and body2 >= 0.6 * atr and bodyP <= 0.5 * body2 and close < open and close < (open[2] + close[2]) / 2
+
+bool useEng  = patSel == "All" or patSel == "Engulfing"
+bool usePin  = patSel == "All" or patSel == "Pin bar"
+bool useStar = patSel == "All" or patSel == "Morning/Evening star"
+
+bool bigEnough = not na(atr) and rng >= minCandle * atr
+
+bool maUp = maMode == "Price vs EMA" ? close > ema : emaF > emaS
+bool maDn = maMode == "Price vs EMA" ? close < ema : emaF < emaS
+bool maLongOK  = maMode == "Off" or (maDir == "With" ? maUp : maDn)
+bool maShortOK = maMode == "Off" or (maDir == "With" ? maDn : maUp)
+
+bool oscLongOK  = oscType == "Off" or (oscLogic == "Reversal zone" ? ov <= oscLow : ov >= 50.0)
+bool oscShortOK = oscType == "Off" or (oscLogic == "Reversal zone" ? ov >= oscHigh : ov <= 50.0)
+
+bool trendLongOK  = maLongOK and oscLongOK
+bool trendShortOK = maShortOK and oscShortOK
+
+bool longSig  = bigEnough and trendLongOK  and ((useEng and bullEng) or (usePin and bullPin) or (useStar and bullStar))
+bool shortSig = bigEnough and trendShortOK and ((useEng and bearEng) or (usePin and bearPin) or (useStar and bearStar))
+
+// number of candles in the pattern, used for the stop reference
+int nb = 1
+if (useEng and (bullEng or bearEng))
+    nb := 2
+if (useStar and (bullStar or bearStar))
+    nb := 3
+
+float lo1 = low
+float lo2 = ta.lowest(low, 2)
+float lo3 = ta.lowest(low, 3)
+float hi1 = high
+float hi2 = ta.highest(high, 2)
+float hi3 = ta.highest(high, 3)
+float patLow  = nb == 3 ? lo3 : nb == 2 ? lo2 : lo1
+float patHigh = nb == 3 ? hi3 : nb == 2 ? hi2 : hi1
+
+// ---------------- entries / exits
+if barstate.isconfirmed and not na(atr) and sessOK and strategy.position_size == 0 and (longSig != shortSig)
+    int sig = longSig ? 1 : -1
+    float dist = sig == 1 ? close - patLow : patHigh - close
+    float riskDist = math.max(dist + stopBuf * atr, minStop * atr)
+    if riskDist <= maxStop * atr
+        float qty = (strategy.equity * riskPct / 100.0) / (riskDist * syminfo.pointvalue)
+        string sid = sig == 1 ? "L" : "S"
+        strategy.entry(sid, sig == 1 ? strategy.long : strategy.short, qty = qty)
+        // ticks are measured from the actual fill price, so gaps are handled correctly
+        strategy.exit("X", sid, loss = riskDist / syminfo.mintick, profit = riskDist * rr / syminfo.mintick)
+
+// ---------------- optional time stop
+if maxBars > 0 and strategy.position_size != 0
+    if bar_index - strategy.opentrades.entry_bar_index(0) >= maxBars
+        strategy.close_all(comment = "time stop")
+
+// ---------------- visuals
+plotshape(longSig and (longSig != shortSig), "Long signal", shape.triangleup, location.belowbar, color.new(color.lime, 0), size = size.tiny)
+plotshape(shortSig and (longSig != shortSig), "Short signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)
+plot(maMode == "Price vs EMA" ? ema : na, "EMA", color = color.new(color.orange, 0))
+plot(maMode == "Fast vs slow EMA" ? emaF : na, "Fast EMA", color = color.new(color.aqua, 0))
+plot(maMode == "Fast vs slow EMA" ? emaS : na, "Slow EMA", color = color.new(color.orange, 0))

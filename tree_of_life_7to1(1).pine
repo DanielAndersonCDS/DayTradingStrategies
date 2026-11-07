@@ -1,0 +1,186 @@
+//@version=6
+strategy("Tree of Life Pattern 7:1", overlay=true, initial_capital=10000, pyramiding=0,
+     margin_long=0, margin_short=0, slippage=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.15,          // per side, USD per oz (0.30 round trip). Edit to your broker's real cost.
+     max_lines_count=100, max_labels_count=100)
+
+// =====================================================================
+//  IDEA
+//  1. Find confirmed swing points with an ATR zigzag (no repainting).
+//  2. Take the last 10 swings and treat them as the 10 Sephirot visited
+//     in Lightning Flash order: Keter -> Chokmah -> Binah -> Chesed ->
+//     Gevurah -> Tiferet -> Netzach -> Hod -> Yesod -> Malkuth.
+//  3. Template = height of each node on the Tree (7 rows) plus a small
+//     left/right offset for the pillars of Severity / Mercy.
+//  4. Pearson correlation between the 10 swing prices and the template.
+//  5. |corr| >= threshold -> trade, stop at the last opposite swing, 7R target.
+// =====================================================================
+
+// ---------------- inputs
+gS = "Swings"
+atrLen   = input.int(14, "ATR length", minval=1, group=gS)
+devMult  = input.float(2.0, "Swing size = ATR x", minval=0.5, step=0.25, group=gS)
+
+gT = "Tree template"
+tplMode  = input.string("Tree of Life", "Template", options=["Tree of Life", "Shuffled nodes", "Random values"], group=gT,
+     tooltip="Use Shuffled / Random with different seeds as a control. If the real Tree does not clearly beat them, the Tree adds nothing.")
+seed     = input.int(1, "Seed (shuffled / random)", minval=1, maxval=2000000000, group=gT)
+pillarW  = input.float(0.6, "Pillar offset weight", minval=0.0, maxval=3.0, step=0.1, group=gT)
+corrThr  = input.float(0.80, "Min |correlation|", minval=0.3, maxval=0.99, step=0.01, group=gT)
+logic    = input.string("Follow the flash", "Signal logic", options=["Follow the flash", "Serpent return (reverse)"], group=gT,
+     tooltip="Follow: descending Tree = SELL, ascending = BUY. Serpent return: the opposite.")
+
+numerology = input.bool(false, "Numerology mode: 7 instead of 6", group=gT,
+     tooltip="Removes every 6 from the template and uses 7: Keter height 6 -> 7, pillar offset 0.6 -> 0.7, min correlation -> 0.77. Overrides those three inputs.")
+
+gR = "Risk"
+rr        = input.float(7.0, "Reward : Risk", minval=1.0, step=0.5, group=gR)
+riskPct   = input.float(1.0, "Risk per trade, % of equity", minval=0.1, step=0.1, group=gR)
+stopBuf   = input.float(0.2, "Stop buffer beyond swing (ATR x)", minval=0.0, step=0.1, group=gR)
+minStop   = input.float(1.0, "Min stop distance (ATR x)", minval=0.1, step=0.1, group=gR)
+maxStop   = input.float(6.0, "Max stop distance (ATR x), skip if wider", minval=1.0, step=0.5, group=gR)
+maxBars   = input.int(0, "Time stop in bars (0 = off)", minval=0, group=gR)
+showDraw  = input.bool(true, "Draw the 10 swings", group=gR)
+
+// effective values (numerology overrides)
+pillarEff = numerology ? 0.7 : pillarW
+corrEff   = numerology ? 0.77 : corrThr
+keterH    = numerology ? 7.0 : 6.0
+
+// ---------------- template (built once)
+nodeNames = array.from("Keter", "Chokmah", "Binah", "Chesed", "Gevurah", "Tiferet", "Netzach", "Hod", "Yesod", "Malkuth")
+rows      = array.from(keterH, 5.0, 5.0, 4.0, 4.0, 3.0, 2.0, 2.0, 1.0, 0.0)     // height on the Tree
+pillars   = array.from(0.0, 1.0, -1.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0)  // +1 Mercy, -1 Severity, 0 middle
+var array<float> tpl = array.new<float>(10, 0.0)
+
+if barstate.isfirst
+    for i = 0 to 9
+        tpl.set(i, rows.get(i) + pillarEff * pillars.get(i))
+    float s = seed
+    if tplMode == "Shuffled nodes"
+        for i = 9 to 1
+            s := (s * 16807) % 2147483647
+            int j = int(s % (i + 1))
+            float tmp = tpl.get(i)
+            tpl.set(i, tpl.get(j))
+            tpl.set(j, tmp)
+    else if tplMode == "Random values"
+        for i = 0 to 9
+            s := (s * 16807) % 2147483647
+            tpl.set(i, 6.0 * (s / 2147483647.0))
+
+// ---------------- swing storage
+var array<float> pP = array.new<float>()   // prices
+var array<int>   pTm = array.new<int>()    // bar times
+var array<int>   pT = array.new<int>()     // +1 high, -1 low
+
+addPivot(array<float> pr, array<int> tm, array<int> ty, float p, int t, int k) =>
+    pr.push(p)
+    tm.push(t)
+    ty.push(k)
+    if pr.size() > 10
+        pr.shift()
+        tm.shift()
+        ty.shift()
+    true
+
+atr = ta.atr(atrLen)
+
+var int   zDir = 0
+var float extP = na
+var int   extT = na
+var float lastC = na
+var array<line>  lns = array.new<line>()
+var array<label> lbs = array.new<label>()
+
+bool newPivot = false
+
+if barstate.isconfirmed and not na(atr)
+    float thr = devMult * atr
+    if zDir == 0
+        zDir := 1
+        extP := high
+        extT := time
+    else if zDir == 1
+        if high > extP
+            extP := high
+            extT := time
+        else if low < extP - thr
+            addPivot(pP, pTm, pT, extP, extT, 1)
+            newPivot := true
+            zDir := -1
+            extP := low
+            extT := time
+    else
+        if low < extP
+            extP := low
+            extT := time
+        else if high > extP + thr
+            addPivot(pP, pTm, pT, extP, extT, -1)
+            newPivot := true
+            zDir := 1
+            extP := high
+            extT := time
+
+// ---------------- evaluate on every new confirmed swing
+if newPivot and pP.size() == 10
+    float sd = pP.stdev() * tpl.stdev()
+    lastC := sd > 0 ? pP.covariance(tpl) / sd : 0.0
+
+    if showDraw
+        for l in lns
+            line.delete(l)
+        for b in lbs
+            label.delete(b)
+        lns.clear()
+        lbs.clear()
+        for i = 0 to 9
+            label lb = label.new(pTm.get(i), pP.get(i),
+                 text = tplMode == "Tree of Life" ? nodeNames.get(i) : str.tostring(i + 1),
+                 xloc = xloc.bar_time,
+                 style = pT.get(i) == 1 ? label.style_label_down : label.style_label_up,
+                 size = size.small, color = color.new(color.purple, 20), textcolor = color.white)
+            lbs.push(lb)
+            if i > 0
+                lns.push(line.new(pTm.get(i - 1), pP.get(i - 1), pTm.get(i), pP.get(i),
+                     xloc = xloc.bar_time, color = color.new(color.purple, 30)))
+
+    int sig = 0
+    if math.abs(lastC) >= corrEff
+        sig := lastC > 0 ? -1 : 1          // descending Tree -> SELL, ascending -> BUY
+        if logic == "Serpent return (reverse)"
+            sig := -sig
+
+    if sig != 0 and strategy.position_size == 0
+        int need = sig == -1 ? 1 : -1      // SELL: stop above last swing high; BUY: below last swing low
+        float ref = na
+        for i = pP.size() - 1 to 0
+            if pT.get(i) == need
+                ref := pP.get(i)
+                break
+        float dist = sig == -1 ? ref - close : close - ref
+        float riskDist = math.max(dist + stopBuf * atr, minStop * atr)
+        if riskDist <= maxStop * atr
+            float qty = (strategy.equity * riskPct / 100.0) / (riskDist * syminfo.pointvalue)
+            string sid = sig == 1 ? "L" : "S"
+            strategy.entry(sid, sig == 1 ? strategy.long : strategy.short, qty = qty)
+            // ticks are measured from the actual fill price, so gaps are handled correctly
+            strategy.exit("X", sid, loss = riskDist / syminfo.mintick, profit = riskDist * rr / syminfo.mintick)
+
+// ---------------- optional time stop
+if maxBars > 0 and strategy.position_size != 0
+    if bar_index - strategy.opentrades.entry_bar_index(0) >= maxBars
+        strategy.close_all(comment = "time stop")
+
+// ---------------- info table
+var table tb = table.new(position.top_right, 2, 4, bgcolor = color.new(color.black, 15), frame_color = color.gray, frame_width = 1)
+if barstate.islast
+    table.cell(tb, 0, 0, "Template", text_color = color.white, text_halign = text.align_left)
+    table.cell(tb, 1, 0, tplMode + (numerology ? " (7)" : ""), text_color = color.white)
+    table.cell(tb, 0, 1, "Swings", text_color = color.white, text_halign = text.align_left)
+    table.cell(tb, 1, 1, str.tostring(pP.size()) + " / 10", text_color = color.white)
+    table.cell(tb, 0, 2, "Last corr", text_color = color.white, text_halign = text.align_left)
+    table.cell(tb, 1, 2, na(lastC) ? "-" : str.tostring(lastC, "#.00"), text_color = math.abs(nz(lastC)) >= corrEff ? color.lime : color.white)
+    table.cell(tb, 0, 3, "Trades", text_color = color.white, text_halign = text.align_left)
+    table.cell(tb, 1, 3, str.tostring(strategy.closedtrades), text_color = color.white)

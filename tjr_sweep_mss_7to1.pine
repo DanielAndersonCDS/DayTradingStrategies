@@ -1,0 +1,119 @@
+//@version=6
+strategy("TJR Sweep + MSS 7:1", overlay=true, initial_capital=10000, pyramiding=0,
+     margin_long=0, margin_short=0, slippage=0, max_labels_count=500,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.15)          // per side, USD per oz (0.30 round trip). Edit to your broker's real cost.
+
+// =====================================================================
+//  Strategy version of the "TJR Trades Strategy" indicator you sent.
+//  Same rules: Asia range -> sweep of its high/low in the trading session
+//  -> market structure shift (close beyond the last pivot) = entry signal,
+//  one signal per direction per session.
+//  Added for trading: stop beyond the sweep extreme, fixed reward:risk,
+//  1% risk per trade. Entry at the next bar's open.
+//  The FVG boxes are only visual in the original, so they are left out.
+// =====================================================================
+
+// ---------------- inputs
+gS = "Session Times (New York)"
+asiaSess    = input.session("2000-0000", "Asia session range", group = gS)
+tradeSess   = input.session("0300-1100", "Trading session range", group = gS)
+tz          = input.string("America/New_York", "Timezone", group = gS)
+mssStrength = input.int(1, "MSS pivot strength", minval = 1, group = gS)
+closeAtEnd  = input.bool(false, "Close open trade when trading session ends", group = gS)
+
+gR = "Risk"
+atrLen   = input.int(14, "ATR length", minval=1, group=gR)
+rr       = input.float(7.0, "Reward : Risk", minval=1.0, step=0.5, group=gR)
+riskPct  = input.float(1.0, "Risk per trade, % of equity", minval=0.1, step=0.1, group=gR)
+stopBuf  = input.float(0.1, "Stop buffer beyond sweep extreme (ATR x)", minval=0.0, step=0.05, group=gR)
+minStop  = input.float(1.0, "Min stop distance (ATR x)", minval=0.1, step=0.1, group=gR)
+maxStop  = input.float(5.0, "Max stop distance (ATR x), skip if wider", minval=1.0, step=0.5, group=gR)
+
+// ---------------- sessions
+isInAsia    = not na(time(timeframe.period, asiaSess, tz))
+isInTrading = not na(time(timeframe.period, tradeSess, tz))
+atr = ta.atr(atrLen)
+
+// ---------------- Asia range
+var float asiaHigh = na
+var float asiaLow  = na
+var bool highSwept = false
+var bool lowSwept  = false
+var float sweepHiX = na      // highest high since the Asia high was swept
+var float sweepLoX = na      // lowest low since the Asia low was swept
+
+if isInAsia and not isInAsia[1]
+    asiaHigh := high
+    asiaLow  := low
+    highSwept := false
+    lowSwept  := false
+    sweepHiX := na
+    sweepLoX := na
+else if isInAsia
+    asiaHigh := math.max(asiaHigh, high)
+    asiaLow  := math.min(asiaLow, low)
+
+// ---------------- sweeps (trading session only)
+if isInTrading and not na(asiaHigh)
+    if high > asiaHigh
+        highSwept := true
+    if low < asiaLow
+        lowSwept := true
+    if highSwept
+        sweepHiX := na(sweepHiX) ? high : math.max(sweepHiX, high)
+    if lowSwept
+        sweepLoX := na(sweepLoX) ? low : math.min(sweepLoX, low)
+
+// ---------------- market structure shift
+pHi = ta.pivothigh(mssStrength, mssStrength)
+pLo = ta.pivotlow(mssStrength, mssStrength)
+var float mssHi = na
+var float mssLo = na
+if not na(pHi)
+    mssHi := pHi
+if not na(pLo)
+    mssLo := pLo
+
+bool bullMSS = lowSwept and not na(mssHi) and close > mssHi and close[1] <= mssHi
+bool bearMSS = highSwept and not na(mssLo) and close < mssLo and close[1] >= mssLo
+
+var bool bullTrig = false
+var bool bearTrig = false
+if not isInTrading
+    bullTrig := false
+    bearTrig := false
+
+bool longSig = false
+bool shortSig = false
+if isInTrading
+    if bullMSS and not bullTrig
+        longSig := true
+        bullTrig := true
+        label.new(bar_index, low, "MSS ▲", color = color.new(color.green, 100), textcolor = color.green, style = label.style_label_up, size = size.small)
+    if bearMSS and not bearTrig
+        shortSig := true
+        bearTrig := true
+        label.new(bar_index, high, "MSS ▼", color = color.new(color.red, 100), textcolor = color.red, style = label.style_label_down, size = size.small)
+
+// ---------------- entries / exits
+if barstate.isconfirmed and not na(atr) and strategy.position_size == 0 and (longSig != shortSig)
+    int sig = longSig ? 1 : -1
+    float ref = sig == 1 ? sweepLoX : sweepHiX
+    if not na(ref)
+        float dist = sig == 1 ? close - ref : ref - close
+        float riskDist = math.max(dist + stopBuf * atr, minStop * atr)
+        if riskDist <= maxStop * atr
+            float qty = (strategy.equity * riskPct / 100.0) / (riskDist * syminfo.pointvalue)
+            string sid = sig == 1 ? "L" : "S"
+            strategy.entry(sid, sig == 1 ? strategy.long : strategy.short, qty = qty)
+            // ticks are measured from the actual fill price, so gaps are handled correctly
+            strategy.exit("X", sid, loss = riskDist / syminfo.mintick, profit = riskDist * rr / syminfo.mintick)
+
+if closeAtEnd and strategy.position_size != 0 and not isInTrading
+    strategy.close_all(comment = "session end")
+
+// ---------------- visuals
+bgcolor(isInAsia ? color.new(color.blue, 92) : isInTrading ? color.new(color.green, 94) : na)
+plot(asiaHigh, "Asia high", color = color.new(color.gray, 20), style = plot.style_linebr)
+plot(asiaLow, "Asia low", color = color.new(color.gray, 20), style = plot.style_linebr)
